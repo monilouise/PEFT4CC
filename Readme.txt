@@ -1,3 +1,1 @@
-In the "./just-in-time", run command "source run.sh" to start the fine-tuning process.
-
-For JIT-DP, the dataset can be downloaded from https://github.com/jacknichao/JIT-Fine.
+Part of the replication package for the paper "Pre-trained Code Language Models for Just-in-time Software Defect Prediction: An Empirical Study".
