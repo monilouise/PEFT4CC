@@ -216,9 +216,12 @@ def test(args, test_dataset, mymodel):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.n_gpu = len(args.available_gpu)
+    #args.n_gpu = len(args.available_gpu)
+    #args.device = device
+    #torch.cuda.set_device(args.available_gpu[0])
+    args.n_gpu = 1
     args.device = device
-    torch.cuda.set_device(args.available_gpu[0])
+    torch.cuda.set_device(0)
 
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO)
@@ -232,7 +235,7 @@ def main(args):
                                    modified_modules=['attention', '[r](\d)+\.output'],
                                    bottleneck_dim=128)
         delta_model.freeze_module(exclude=["deltas", "LayerNorm"], set_state_dict=False)
-    elif args.pretrained_model in ["codet5"]:
+    elif args.pretrained_model in ["codet5", "codet5p-770m", "codet5p", "codet5p-2b", "codet5p-16b", "codereviewer"]:
         delta_model = AdapterModel(backbone_model=model,
                                    modified_modules=['layer.0', 'layer.2', '[r]encoder\.block\.(\d)+\.layer\.[01]'],
                                    bottleneck_dim=128)
@@ -244,7 +247,8 @@ def main(args):
         delta_model.freeze_module(exclude=["deltas", "self_attn_layer_norm", "final_layer_norm"], set_state_dict=False)
     # delta_model.log()
 
-    mymodel = SingleModel(model, config, tokenizer, args).to(device)
+    #mymodel = SingleModel(model, config, tokenizer, args).to(device)
+    mymodel = ConcatModel(model, config, tokenizer, args).to(device)
     # print(mymodel)
 
     # store_path = "../datasets/jitfine"
