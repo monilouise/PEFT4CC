@@ -32,7 +32,8 @@ class SingleModel(nn.Module):
                 outputs = self.encoder.base_model.model(input_ids=input_ids, attention_mask=input_mask)
             else:
                 outputs = self.encoder(input_ids=input_ids, attention_mask=input_mask)
-        elif self.args.pretrained_model in ["codet5"]:
+        elif self.args.pretrained_model in ["codet5", "codet5p", "codet5p-770m", "codet5p-2b", 
+                                            "codet5p-6b", "codet5p-16b"]:
             outputs = self.encoder.encoder(input_ids=input_ids, attention_mask=input_mask)
         elif self.args.pretrained_model in ["plbart", "plbart-large"]:
             if self.args.use_lora:
