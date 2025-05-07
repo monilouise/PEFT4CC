@@ -76,7 +76,6 @@ def build_model_tokenizer_config(args):
         "unixcoder": (RobertaModel, RobertaTokenizer, RobertaConfig, "microsoft/unixcoder-base"),
         "plbart": (PLBartForConditionalGeneration, PLBartTokenizer, PLBartConfig, "uclanlp/plbart-base"),
         "plbart-large": (PLBartForConditionalGeneration, PLBartTokenizer, PLBartConfig, "uclanlp/plbart-large"),
-        #fork by monilouise
         "codet5p": (T5ForConditionalGeneration, RobertaTokenizer, T5Config, "Salesforce/codet5p-220m-bimodal"),
         "codet5p-770m": (T5ForConditionalGeneration, RobertaTokenizer, T5Config, "Salesforce/codet5p-770m"),
         "codet5p-2b": (T5ForConditionalGeneration, CodeGenTokenizer, T5Config, "Salesforce/codet5p-2b"),
