@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from transformers import (RobertaModel, RobertaTokenizer, RobertaConfig, T5ForConditionalGeneration, T5Config,
                           PLBartTokenizer, PLBartForConditionalGeneration, PLBartConfig, CodeGenTokenizer, 
-                          AutoTokenizer, AutoModel)
+                          AutoTokenizer, AutoModel, RobertaForCausalLM)
 import logging
 
 
@@ -50,6 +50,7 @@ def parse_jit_args():
     
     parser.add_argument("--skewed_oversample", action='store_true', default=False)
     parser.add_argument("--window_size", type=int, default=100)
+    #parser.add_argument("--target_th", type=float, default=0.4)
     parser.add_argument("--target_th", type=float, default=0.5)
     parser.add_argument("--l0", type=float, default=10)
     parser.add_argument("--l1", type=float, default=12)
@@ -76,6 +77,7 @@ def build_model_tokenizer_config(args):
         "unixcoder": (RobertaModel, RobertaTokenizer, RobertaConfig, "microsoft/unixcoder-base"),
         "plbart": (PLBartForConditionalGeneration, PLBartTokenizer, PLBartConfig, "uclanlp/plbart-base"),
         "plbart-large": (PLBartForConditionalGeneration, PLBartTokenizer, PLBartConfig, "uclanlp/plbart-large"),
+        #fork by monilouise
         "codet5p": (T5ForConditionalGeneration, RobertaTokenizer, T5Config, "Salesforce/codet5p-220m-bimodal"),
         "codet5p-770m": (T5ForConditionalGeneration, RobertaTokenizer, T5Config, "Salesforce/codet5p-770m"),
         "codet5p-2b": (T5ForConditionalGeneration, CodeGenTokenizer, T5Config, "Salesforce/codet5p-2b"),

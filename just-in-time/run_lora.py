@@ -24,12 +24,14 @@ import pandas as pd
 
 from skewed_oversample import SkewedRandomSampler, update_orb
 import pickle
+import matplotlib.pyplot as plt
+from river import metrics
 
 logger = logging.getLogger(__name__)
 
 
 def train(args, train_dataset, eval_dataset, mymodel):
-    if args.oversample:
+    if args.oversample: 
         targets = train_dataset.get_targets()
         class_counts = np.bincount(targets)
         assert len(class_counts) == 2
@@ -38,7 +40,7 @@ def train(args, train_dataset, eval_dataset, mymodel):
         logger.info(f"class_weights: {class_weights}")
         sample_weights = class_weights[targets]
         train_sampler = WeightedRandomSampler(weights=sample_weights, num_samples=int(class_counts[0] + class_counts[1]), replacement=True)
-    elif args.skewed_oversample:
+    elif args.skewed_oversample: 
         train_sampler = SkewedRandomSampler(train_dataset, len(train_dataset))
     elif args.undersample: 
         targets = train_dataset.get_targets()
@@ -63,8 +65,8 @@ def train(args, train_dataset, eval_dataset, mymodel):
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=4)
 
     args.max_steps = args.epochs * len(train_dataloader)
-    #args.save_steps = len(train_dataloader) // 5
-    args.save_steps = len(train_dataloader)
+
+    args.save_steps = max(len(train_dataloader), len(train_dataloader) // 5)
     args.warmup_steps = 0
 
     optimizer = AdamW(mymodel.parameters(), lr=args.learning_rate)
@@ -75,6 +77,7 @@ def train(args, train_dataset, eval_dataset, mymodel):
     if args.n_gpu > 1:
         mymodel = torch.nn.DataParallel(mymodel, device_ids=args.available_gpu)
 
+    #best_f1 = 0
     best = 0
 
     # Evaluate before training
@@ -147,9 +150,26 @@ def train(args, train_dataset, eval_dataset, mymodel):
                     }
                     torch.save(save_content, output_file)
                     model_changed = True
-                elif args.eval_metric == "gmean" and results["g_mean"] > best:
+                elif args.eval_metric == "gmean" and "g_mean" in results and results["g_mean"] > best:
                     patience = 0
                     best = results["g_mean"]
+                    checkpoint_prefix = "checkpoint-best-gmean"
+                    output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    model_to_save = mymodel.module if hasattr(mymodel, 'module') else mymodel
+                    output_file = os.path.join(output_dir, "model.bin")
+                    save_content = {
+                        "model_state_dict": model_to_save.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict()
+                    }
+                    logger.info("Saving model to {}".format(output_file))
+                    torch.save(save_content, output_file)
+                    model_changed = True
+                elif args.eval_metric == "gmean" and "eval_loss" in results and (results["eval_loss"] < best or best == 0):
+                    patience = 0
+                    best = results["eval_loss"]
                     checkpoint_prefix = "checkpoint-best-gmean"
                     output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
                     if not os.path.exists(output_dir):
@@ -172,7 +192,7 @@ def train(args, train_dataset, eval_dataset, mymodel):
         #skewed oversampler 
         if args.skewed_oversample:
             update_sampler(args, train_dataset, mymodel, train_sampler)
-
+          
     if model_changed:
         update_training_status(args, "changed")
     else:
@@ -267,39 +287,54 @@ def evaluate_gmean(args, eval_dataset, mymodel):
 
     pred_prob = np.concatenate(pred_prob, 0)
     true_label = np.concatenate(true_label, 0)
-    best_threshold = args.threshold
 
-    print(pred_prob)
-    pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
+    if true_label.sum() > 0 and true_label.sum() < len(true_label):
+        best_threshold = args.threshold
 
-    precision = precision_score(true_label, pred_label, average="binary")
-    recall = recall_score(true_label, pred_label, average="binary")
-    f1 = f1_score(true_label, pred_label, average="binary")
+        pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
 
-    fpr, tpr, thres = roc_curve(true_label, pred_prob)
-    auc_score = auc(fpr, tpr)
+        precision = precision_score(true_label, pred_label, average="binary")
+        recall = recall_score(true_label, pred_label, average="binary")
+        f1 = f1_score(true_label, pred_label, average="binary")
 
-    # Calculate G-Mean
-    tn, fp, fn, tp = confusion_matrix(true_label, pred_label).ravel()
-    g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
-    r1 = tp / (tp + fn)
-    assert r1 == recall
+        fpr, tpr, thres = roc_curve(true_label, pred_prob)
+        auc_score = auc(fpr, tpr)
 
-    result = {
-        "eval_recall": recall,
-        "eval_precision": precision,
-        "eval_f1": f1,
-        "auc_score": auc_score,
-        "g_mean": g_mean,
-    }
+        # Calculate G-Mean
+        tn, fp, fn, tp = confusion_matrix(true_label, pred_label).ravel()
+        g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
+        r1 = tp / (tp + fn)
+        assert r1 == recall
 
+        result = {
+            "eval_recall": recall,
+            "eval_precision": precision,
+            "eval_f1": f1,
+            "auc_score": auc_score,
+            "g_mean": g_mean,
+        }
+
+    else:
+        logger.info("No positive examples -> using validation loss...")
+        result = {"eval_loss": loss}
+    
     logger.info("***** Eval results *****")
     for key in sorted(result.keys()):
-        logger.info("  %s = %s", key, str(round(result[key], 4)))
+        logger.info("  %s = %s", key, str(round(float(result[key]), 4)))
 
     return result
 
-
+def find_best_threshold(fpr, tpr, thresholds):
+    distances = np.sqrt((fpr - 0)**2 + (tpr - 1)**2)
+    best_index = np.argmin(distances)
+    return {
+        'best_threshold': thresholds[best_index],
+        'fpr': fpr[best_index],
+        'tpr': tpr[best_index],
+        'distance': distances[best_index],
+        'fpr_all': fpr,
+        'tpr_all': tpr
+    }
 
 def test(args, test_dataset, mymodel):
     test_sampler = SequentialSampler(test_dataset)
@@ -327,6 +362,7 @@ def test(args, test_dataset, mymodel):
     if args.calculate_metrics:
         assert true_label.sum() > 0
 
+    logger.info("best_threshold = " + str(best_threshold))
     pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
 
     if args.calculate_metrics: 
@@ -337,25 +373,34 @@ def test(args, test_dataset, mymodel):
         precision = precision_score(true_label, pred_label, average="binary")
         recall = recall_score(true_label, pred_label, average="binary")
         f1 = f1_score(true_label, pred_label, average="binary")
-
         fpr, tpr, thres = roc_curve(true_label, pred_prob)
         auc_score = auc(fpr, tpr)
 
         # Calculate G-Mean
-        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel()
-        g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
-        r1 = tp / (tp + fn)
-            
-        print('r1 = ', r1)
-        print('recall = ', recall)
-        assert r1 == recall
-        r0 = tn / (tn + fp)
+        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel() e
+
+        g_mean = 0
+        r1 = 0
+        r0 = 0
+
+        if tp + fn > 0 and tn + fp > 0:    
+            g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
+            r1 = tp / (tp + fn)
+                
+            assert r1 == recall
+            r0 = tn / (tn + fp)
+
+        #Rolling ROC AUC
+        metric = metrics.RollingROCAUC()
+        for yt, yp in zip(true_label, pred_prob):
+            metric.update(yt, yp)
 
         result = {
             "test_recall": recall,
             "test_precision": precision,
             "test_f1": f1,
             "auc_score": auc_score,
+            "rolling_auc": metric.get(),
             "g_mean": g_mean,
             "R0": r0,
             "R1": r1
@@ -500,6 +545,7 @@ if __name__ == "__main__":
     args = parse_jit_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+    logger.setLevel(logging.INFO)
     main(args)
     # M + EF
     #main_test(args)

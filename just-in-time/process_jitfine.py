@@ -26,6 +26,8 @@ def parse_data_file(args, mode):
 
     ccdata = pd.read_pickle(codechange_file)
     fedata = pd.read_pickle(feature_file)
+    
+    original_fedata = fedata.copy()
 
     # store parsed data.
     examples = []
@@ -43,6 +45,47 @@ def parse_data_file(args, mode):
     for commit_id, label, msg, code in zip(commit_ids, labels, msgs, codes):
         manual_features = fedata[fedata["commit_hash"] == commit_id][manual_features_columns].to_numpy().squeeze()
         examples.append((commit_id, label, msg, code, manual_features))
+
+    if mode == "train":
+        random.seed(args.seed)
+        random.shuffle(examples)
+
+    return examples
+
+
+def parse_data_file_with_timestamp(args, mode):
+    codechange_file = ""
+    feature_file = ""
+    if mode == "train":
+        codechange_file, feature_file = args.train_data_file
+    elif mode == "eval":
+        codechange_file, feature_file = args.eval_data_file
+    elif mode == "test":
+        codechange_file, feature_file = args.test_data_file
+
+    ccdata = pd.read_pickle(codechange_file)
+    fedata = pd.read_pickle(feature_file)
+
+    original_fedata = fedata.copy()
+
+    # store parsed data.
+    examples = []
+
+    # parse fedata.
+    manual_features_columns = ["la", "ld", "nf", "ns", "nd", "entropy", "ndev",
+                               "lt", "nuc", "age", "exp", "rexp", "sexp", "fix"]
+    fedata = normalize_df(fedata, manual_features_columns)
+    # standardize fedata along any features.
+    manual_features = preprocessing.scale(fedata[manual_features_columns].to_numpy())
+    fedata[manual_features_columns] = manual_features
+
+    # parse ccdata.
+    commit_ids, labels, msgs, codes = ccdata
+    for commit_id, label, msg, code in zip(commit_ids, labels, msgs, codes):
+        manual_features = fedata[fedata["commit_hash"] == commit_id][manual_features_columns].to_numpy().squeeze()
+        timestamp = original_fedata[original_fedata["commit_hash"] == commit_id]["author_date_unix_timestamp"].to_numpy().squeeze()
+        examples.append((commit_id, label, msg, code, manual_features, int(timestamp)
+                         ))
 
     if mode == "train":
         random.seed(args.seed)
