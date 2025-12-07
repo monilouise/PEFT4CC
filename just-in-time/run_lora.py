@@ -1,11 +1,8 @@
 import torch
 import os
-import dill
 import logging
-import multiprocessing
 import numpy as np
 from tqdm import tqdm
-from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 from sklearn.metrics import recall_score, precision_score, f1_score, auc, roc_curve, confusion_matrix
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler, SubsetRandomSampler
 #from transformers import RobertaModel, RobertaTokenizer, RobertaConfig, AdamW, get_linear_schedule_with_warmup
@@ -14,23 +11,22 @@ from peft import LoraConfig, TaskType, get_peft_model
 from torch.optim.adamw import AdamW
 
 from util import parse_jit_args, set_seed, build_model_tokenizer_config
-from process_jitfine import JITFineDataset, JITFineMessageManualDataset, JITFineDatasetWithTextManualFeatures
-from models.SingleModel import SingleModel
+from process_jitfine import JITFineDataset
 from models.ConcatModel import ConcatModel
 from models.ManualModel import ManualModel
 from process_jitfine import JITFineManualDataset
 
 import pandas as pd
 
-from skewed_oversample import SkewedRandomSampler, update_orb
+from skewed_oversample import SkewedRandomSampler
 import pickle
-import matplotlib.pyplot as plt
-from river import metrics
+from defect_localization import locate_defects
+from online_training import calculate_rolling_roc_auc
 
 logger = logging.getLogger(__name__)
 
 
-def train(args, train_dataset, eval_dataset, mymodel):
+def train(args, train_dataset, eval_dataset, mymodel, ma_dataset=None):
     if args.oversample: 
         targets = train_dataset.get_targets()
         class_counts = np.bincount(targets)
@@ -42,7 +38,7 @@ def train(args, train_dataset, eval_dataset, mymodel):
         train_sampler = WeightedRandomSampler(weights=sample_weights, num_samples=int(class_counts[0] + class_counts[1]), replacement=True)
     elif args.skewed_oversample: 
         train_sampler = SkewedRandomSampler(train_dataset, len(train_dataset))
-    elif args.undersample: 
+    elif args.undersample:
         targets = train_dataset.get_targets()
         class_counts = np.bincount(targets)
         assert len(class_counts) == 2
@@ -65,7 +61,6 @@ def train(args, train_dataset, eval_dataset, mymodel):
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=4)
 
     args.max_steps = args.epochs * len(train_dataloader)
-
     args.save_steps = max(len(train_dataloader), len(train_dataloader) // 5)
     args.warmup_steps = 0
 
@@ -100,9 +95,12 @@ def train(args, train_dataset, eval_dataset, mymodel):
         tr_loss = 0
         tr_num = 0
         for step, batch in enumerate(bar):
-            input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+            #input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+            commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
             mymodel.train()
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            #_, loss, _ = mymodel(input_ids, input_mask, manual_features, label)
+            _, loss, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device), output_attentions=True)
             if args.n_gpu > 1:
                 loss = loss.mean()
 
@@ -191,19 +189,21 @@ def train(args, train_dataset, eval_dataset, mymodel):
                     
         #skewed oversampler 
         if args.skewed_oversample:
-            update_sampler(args, train_dataset, mymodel, train_sampler)
-          
+            update_sampler(args, ma_dataset, mymodel, train_sampler)
+             
     if model_changed:
         update_training_status(args, "changed")
     else:
         update_training_status(args, "unchanged")
 
-def update_sampler(args, train_dataset, mymodel, train_sampler):
+def update_sampler(args, ma_dataset, mymodel, train_sampler):
     logger.info(f"Updating sampler. Window size = {args.window_size}, target_th = {args.target_th}, l0 = {args.l0}, l1 = {args.l1}, m = {args.m}")
-    results_ma = predict_ma(args, train_dataset[-args.window_size:], mymodel)
-    orb0, orb1 = update_orb(results_ma, args.target_th, args.l0, args.l1, args.m)
-    train_sampler.obf0 = orb0
-    train_sampler.obf1 = orb1
+    assert len(ma_dataset) <= args.window_size, "Dataset must have at most window_size elements for skewed oversampling."
+    results_ma = predict_ma(args, ma_dataset, mymodel)
+    #orb0, orb1 = update_orb(results_ma, args.target_th, args.l0, args.l1, args.m)
+    #train_sampler.obf0 = orb0
+    #train_sampler.obf1 = orb1
+    train_sampler.update_orb(results_ma, args.target_th, args.l0, args.l1, args.m)
 
 def update_training_status(args, status):
     with open(os.path.join(args.output_dir, "training_status.txt"), "w") as log_file:
@@ -217,9 +217,13 @@ def predict_ma(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        #input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        _, input_ids, input_mask, manual_features, label = [x for x in batch]
+        
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            #prob, _, _ = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device))
             pred_prob.append(prob.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
@@ -237,9 +241,10 @@ def evaluate(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        _, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device), output_attentions=True)
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
 
@@ -279,9 +284,12 @@ def evaluate_gmean(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        #input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        _, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            #prob, loss, _ = mymodel(input_ids, input_mask, manual_features, label)
+            prob, loss, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                    label.to(args.device))
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
 
@@ -335,8 +343,9 @@ def find_best_threshold(fpr, tpr, thresholds):
         'fpr_all': fpr,
         'tpr_all': tpr
     }
-
-def test(args, test_dataset, mymodel):
+    
+    
+def test(args, test_dataset, mymodel, tokenizer):
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=4)
 
@@ -346,17 +355,27 @@ def test(args, test_dataset, mymodel):
 
     pred_prob = []
     true_label = []
+    commits = []
     mymodel.eval()
-
+    
+    attns = []
     for batch in test_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, attn_weights = mymodel(input_ids.to(args.device), input_mask.to(args.device), 
+                                            manual_features.to(args.device), label.to(args.device), 
+                                            output_attentions=True)
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
+            commits.append(commit_ids)
+            last_layer_attn_weights = attn_weights
+            attns.append(last_layer_attn_weights.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
     true_label = np.concatenate(true_label, 0)
+    commits = np.concatenate(commits, 0)
+    attns = np.concatenate(attns, 0)
+    
     best_threshold = args.threshold
 
     if args.calculate_metrics:
@@ -365,20 +384,21 @@ def test(args, test_dataset, mymodel):
     logger.info("best_threshold = " + str(best_threshold))
     pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
 
-    if args.calculate_metrics: 
+    if args.calculate_metrics:
         # Save results to excel
-        results_df = pd.DataFrame({'pred_prob': pred_prob.squeeze(), 'true_label': true_label, 'pred_label': pred_label})
-        results_df.to_excel('results.xlsx', index=False)
+        results_df = pd.DataFrame({'commit_id': commits, 'pred_prob': pred_prob.squeeze(), 
+                                   'true_label': true_label, 'pred_label': pred_label})
+        results_df.to_csv('results.csv', index=False)
 
         precision = precision_score(true_label, pred_label, average="binary")
         recall = recall_score(true_label, pred_label, average="binary")
         f1 = f1_score(true_label, pred_label, average="binary")
+
         fpr, tpr, thres = roc_curve(true_label, pred_prob)
         auc_score = auc(fpr, tpr)
 
         # Calculate G-Mean
-        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel() e
-
+        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel()
         g_mean = 0
         r1 = 0
         r0 = 0
@@ -391,9 +411,7 @@ def test(args, test_dataset, mymodel):
             r0 = tn / (tn + fp)
 
         #Rolling ROC AUC
-        metric = metrics.RollingROCAUC()
-        for yt, yp in zip(true_label, pred_prob):
-            metric.update(yt, yp)
+        metric = calculate_rolling_roc_auc(pred_prob, true_label)
 
         result = {
             "test_recall": recall,
@@ -412,12 +430,17 @@ def test(args, test_dataset, mymodel):
         logger.info("***** Test results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
-
+        
     predictions = {'pred_label': pred_label, 'true_label': true_label, 'pred_prob': pred_prob.tolist()}
 
     with open('predictions.pkl', 'wb') as f:
         pickle.dump(predictions, f)
+        
+    #Defect localization
+    if args.do_locate_defects:
+        locate_defects(tokenizer, test_dataset, pred_label, pred_prob, attns, args)
 
+"""
 def main_test(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #args.n_gpu = len(args.available_gpu)
@@ -473,6 +496,7 @@ def main_test(args):
         checkpoint = torch.load(output_dir)
         mymodel.load_state_dict(checkpoint['model_state_dict'])
         test(args, test_dataset, mymodel)
+"""
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -502,7 +526,6 @@ def main(args):
         mymodel = ManualModel(args).to(device)
     else:
         mymodel = ConcatModel(model, config, tokenizer, args).to(device)
-        #mymodel = SingleModel(model, config, tokenizer, args).to(device)
 
     if args.do_train:
         logger.info("Training for the first time...")
@@ -512,11 +535,14 @@ def main(args):
         else:
             train_dataset = JITFineDataset(tokenizer, args, "train")
             eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
+            
+        if args.skewed_oversample:
+            ma_dataset = JITFineDataset(tokenizer, args, "train", is_ma_dataset=True)
+            
+        train(args, train_dataset, eval_dataset, mymodel, ma_dataset if args.skewed_oversample else None)
         
     if args.do_resume_training:
         logger.info("Resuming training...")
-        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
@@ -527,19 +553,23 @@ def main(args):
         else:
             train_dataset = JITFineDataset(tokenizer, args, "train")
             eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
+            
+        if args.skewed_oversample:
+            ma_dataset = JITFineDataset(tokenizer, args, "train", is_ma_dataset=True)
+                
+        train(args, train_dataset, eval_dataset, mymodel, ma_dataset if args.skewed_oversample else None)
     
     if args.do_test:
         if args.only_manual:
             test_dataset = JITFineManualDataset(args, "test")
         else:
             test_dataset = JITFineDataset(tokenizer, args, "test")
-        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
+
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
         mymodel.load_state_dict(checkpoint['model_state_dict'])
-        test(args, test_dataset, mymodel)
+        test(args, test_dataset, mymodel, tokenizer)
 
 if __name__ == "__main__":
     args = parse_jit_args()

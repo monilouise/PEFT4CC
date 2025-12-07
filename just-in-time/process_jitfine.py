@@ -5,6 +5,7 @@ import pandas as pd
 from torch.utils.data import Dataset
 from sklearn import preprocessing
 from transformers import RobertaTokenizer
+import re
 
 from util import parse_jit_args, build_model_tokenizer_config, set_seed
 
@@ -27,8 +28,54 @@ def parse_data_file(args, mode):
     ccdata = pd.read_pickle(codechange_file)
     fedata = pd.read_pickle(feature_file)
     
-    original_fedata = fedata.copy()
+    examples = process_fedata_ccdata(fedata, ccdata)
 
+    if mode == "train":
+        random.seed(args.seed)
+        random.shuffle(examples)
+
+    return examples
+
+def parse_ma_data(args):
+    codechange_file = ""
+    feature_file = ""
+    codechange_file, feature_file = args.train_data_file
+    
+    ccdata = pd.read_pickle(codechange_file)
+    fedata = pd.read_pickle(feature_file)
+    
+    if args.dataset_name:
+        target_data = fedata[fedata['project'] == args.dataset_name]
+
+        if args.cross_project:    
+            #For updating skewed oversampling parameters, consider only data from the target project.
+            fedata = target_data
+            commits = []
+            labels = []
+            commit_messages = []
+            codes = []
+
+            for _, row in fedata.iterrows():
+                commit_id = row['commit_hash']
+                idx = ccdata[0].index(commit_id)
+                label = row['is_buggy_commit']
+                commit_message = ccdata[2][idx]
+                code = ccdata[3][idx]
+                commits.append(commit_id)
+                labels.append(label)
+                commit_messages.append(commit_message)
+                codes.append(code)
+
+            assert len(commits) == len(labels) == len(commit_messages) == len(codes) == fedata.shape[0]
+            ccdata = (commits, labels, commit_messages, codes)
+        else:
+            assert len(target_data) == len(fedata)
+
+    ma_examples = process_fedata_ccdata(fedata[-args.window_size:], ccdata, ccdata_index=-args.window_size)
+
+    return ma_examples
+
+def process_fedata_ccdata(fedata, ccdata, ccdata_index=0):
     # store parsed data.
     examples = []
 
@@ -42,16 +89,11 @@ def parse_data_file(args, mode):
 
     # parse ccdata.
     commit_ids, labels, msgs, codes = ccdata
-    for commit_id, label, msg, code in zip(commit_ids, labels, msgs, codes):
+    for commit_id, label, msg, code in zip(commit_ids[ccdata_index:], labels[ccdata_index:], msgs[ccdata_index:], codes[ccdata_index:]):
         manual_features = fedata[fedata["commit_hash"] == commit_id][manual_features_columns].to_numpy().squeeze()
         examples.append((commit_id, label, msg, code, manual_features))
-
-    if mode == "train":
-        random.seed(args.seed)
-        random.shuffle(examples)
-
+    
     return examples
-
 
 def parse_data_file_with_timestamp(args, mode):
     codechange_file = ""
@@ -65,7 +107,7 @@ def parse_data_file_with_timestamp(args, mode):
 
     ccdata = pd.read_pickle(codechange_file)
     fedata = pd.read_pickle(feature_file)
-
+    
     original_fedata = fedata.copy()
 
     # store parsed data.
@@ -110,8 +152,21 @@ def further_parse(example, tokenizer, args):
     removed_tokens.extend(tokenizer.tokenize(codes))
 
     input_tokens = msg_tokens + ['[ADD]'] + added_tokens + ['[DEL]'] + removed_tokens
-    input_tokens = input_tokens[:args.max_input_tokens - 2]
-    input_tokens = [tokenizer.cls_token] + input_tokens + [tokenizer.sep_token]
+    # Step 1 adaptation for CodeT5+: handle absence of cls_token / sep_token
+    max_core = args.max_input_tokens - 2  # default reserve for special tokens
+    # Determine boundary tokens gracefully
+    cls_tok = getattr(tokenizer, 'cls_token', None)
+    sep_tok = getattr(tokenizer, 'sep_token', None)
+    eos_tok = getattr(tokenizer, 'eos_token', None)
+    bos_tok = getattr(tokenizer, 'bos_token', None)
+    # For T5 family usually only eos_token is defined; no cls_token
+    if cls_tok is None:
+        # Use bos if available, else reuse eos, else fallback to first manual special
+        cls_tok = bos_tok or eos_tok or '<s>'
+    if sep_tok is None:
+        sep_tok = eos_tok or '</s>'
+    input_tokens = input_tokens[:max_core]
+    input_tokens = [cls_tok] + input_tokens + [sep_tok]
     input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
 
@@ -122,7 +177,7 @@ def further_parse(example, tokenizer, args):
     assert len(input_ids) == args.max_input_tokens
     assert len(input_mask) == args.max_input_tokens
 
-    return torch.tensor(input_ids), torch.tensor(input_mask), torch.tensor(manual_features), label
+    return commit_id, torch.tensor(input_ids), torch.tensor(input_mask), torch.tensor(manual_features), label
 
 def further_parse_with_text_manual_features(example, tokenizer, args):
     commit_id, label, msg, code, manual_features = example
@@ -148,8 +203,11 @@ def further_parse_with_text_manual_features(example, tokenizer, args):
     removed_tokens.extend(tokenizer.tokenize(codes))
 
     input_tokens = ["<s>"] + manual_features_tokens + ["<s>"] + msg_tokens + ['[ADD]'] + added_tokens + ['[DEL]'] + removed_tokens
-    input_tokens = input_tokens[:args.max_input_tokens - 2]
-    input_tokens = [tokenizer.cls_token] + input_tokens + [tokenizer.sep_token]
+    max_core = args.max_input_tokens - 2
+    cls_tok = getattr(tokenizer, 'cls_token', None) or getattr(tokenizer, 'bos_token', None) or getattr(tokenizer, 'eos_token', None) or '<s>'
+    sep_tok = getattr(tokenizer, 'sep_token', None) or getattr(tokenizer, 'eos_token', None) or '</s>'
+    input_tokens = input_tokens[:max_core]
+    input_tokens = [cls_tok] + input_tokens + [sep_tok]
     input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
 
@@ -179,8 +237,11 @@ def further_parse_with_timestamp(example, tokenizer, args):
     removed_tokens.extend(tokenizer.tokenize(codes))
 
     input_tokens = msg_tokens + ['[ADD]'] + added_tokens + ['[DEL]'] + removed_tokens
-    input_tokens = input_tokens[:args.max_input_tokens - 2]
-    input_tokens = [tokenizer.cls_token] + input_tokens + [tokenizer.sep_token]
+    max_core = args.max_input_tokens - 2
+    cls_tok = getattr(tokenizer, 'cls_token', None) or getattr(tokenizer, 'bos_token', None) or getattr(tokenizer, 'eos_token', None) or '<s>'
+    sep_tok = getattr(tokenizer, 'sep_token', None) or getattr(tokenizer, 'eos_token', None) or '</s>'
+    input_tokens = input_tokens[:max_core]
+    input_tokens = [cls_tok] + input_tokens + [sep_tok]
     input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
 
@@ -200,8 +261,11 @@ def further_parse_msg_manual(example, tokenizer, args):
     msg_tokens = msg_tokens[:min(args.max_msg_length, len(msg_tokens))]
 
     input_tokens = msg_tokens
-    input_tokens = input_tokens[:args.max_input_tokens - 2]
-    input_tokens = [tokenizer.cls_token] + input_tokens + [tokenizer.sep_token]
+    max_core = args.max_input_tokens - 2
+    cls_tok = getattr(tokenizer, 'cls_token', None) or getattr(tokenizer, 'bos_token', None) or getattr(tokenizer, 'eos_token', None) or '<s>'
+    sep_tok = getattr(tokenizer, 'sep_token', None) or getattr(tokenizer, 'eos_token', None) or '</s>'
+    input_tokens = input_tokens[:max_core]
+    input_tokens = [cls_tok] + input_tokens + [sep_tok]
     input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
 
@@ -221,8 +285,12 @@ def further_parse_manual(example):
 
 
 class JITFineDataset(Dataset):
-    def __init__(self, tokenizer, args, mode):
-        self.mid_examples = parse_data_file(args, mode)
+    def __init__(self, tokenizer, args, mode, is_ma_dataset=False):
+        if is_ma_dataset:
+            self.mid_examples = parse_ma_data(args)
+        else:
+            self.mid_examples = parse_data_file(args, mode)
+        
         self.examples = [further_parse(item, tokenizer, args) for item in self.mid_examples]
 
     def __len__(self):
@@ -231,8 +299,29 @@ class JITFineDataset(Dataset):
     def __getitem__(self, index):
         return self.examples[index]
     
-    def get_targets(self):
-        return [item[3] for item in self.examples]
+def preprocess_code_line(code, remove_python_common_tokens=False):
+    code = code.replace('(', ' ').replace(')', ' ').replace('{', ' ').replace('}', ' ').replace('[', ' ').replace(']',
+                                                                                                                  ' ').replace(
+        '.', ' ').replace(':', ' ').replace(';', ' ').replace(',', ' ').replace(' _ ', '_')
+
+    code = re.sub('``.*``', '<STR>', code)
+    code = re.sub("'.*'", '<STR>', code)
+    code = re.sub('".*"', '<STR>', code)
+    code = re.sub('\d+', '<NUM>', code)
+
+    code = code.split()
+    code = ' '.join(code)
+    if remove_python_common_tokens:
+        new_code = ''
+        python_common_tokens = []
+        for tok in code.split():
+            if tok not in [python_common_tokens]:
+                new_code = new_code + tok + ' '
+
+        return new_code.strip()
+
+    else:
+        return code.strip()
     
 class JITFineDatasetWithTextManualFeatures(Dataset):
     def __init__(self, tokenizer, args, mode):

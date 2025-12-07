@@ -4,8 +4,19 @@ import numpy as np
 import torch
 from transformers import (RobertaModel, RobertaTokenizer, RobertaConfig, T5ForConditionalGeneration, T5Config,
                           PLBartTokenizer, PLBartForConditionalGeneration, PLBartConfig, CodeGenTokenizer, 
-                          AutoTokenizer, AutoModel, RobertaForCausalLM)
+                          AutoTokenizer, AutoModel)
 import logging
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"yes", "true", "t", "1", "y"}:
+        return True
+    if value in {"no", "false", "f", "0", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def parse_jit_args():
@@ -50,12 +61,38 @@ def parse_jit_args():
     
     parser.add_argument("--skewed_oversample", action='store_true', default=False)
     parser.add_argument("--window_size", type=int, default=100)
-    #parser.add_argument("--target_th", type=float, default=0.4)
     parser.add_argument("--target_th", type=float, default=0.5)
     parser.add_argument("--l0", type=float, default=10)
     parser.add_argument("--l1", type=float, default=12)
     parser.add_argument("--m", type=float, default=1.5)
     parser.add_argument("--only_manual", action='store_true', default=False)
+    parser.add_argument("--dataset_name", type=str, default=None)
+    parser.add_argument("--cross_project", action='store_true', default=False)
+    parser.add_argument("--buggy_line_filepath", type=str, default=None)
+    parser.add_argument("--only_adds", type=str2bool, nargs='?', const=True, default=True,
+                        help="Whether to consider only added lines for localization (pass False to include deletions)")
+
+    # Localization inference-only enhancements
+    parser.add_argument("--loc_last_k_layers", type=int, default=1, help="Number of last encoder layers to average attentions over for defect localization (1 = last layer only).")
+    parser.add_argument("--loc_layer_weighting", type=str, default="none", choices=["none", "exp"], help="Strategy to combine last k layers: uniform average or exponential weights (exp higher weight to last).")
+    parser.add_argument("--loc_layer_exp_alpha", type=float, default=0.7, help="Alpha for exponential layer weighting: w_i = exp(-alpha*(k-1-i)). Higher alpha decays older layers faster.")
+    parser.add_argument("--loc_attn_temp", type=float, default=1.0, help="Temperature (<1 sharpens, >1 suaviza) aplicada à distribuição de atenção CLS->tokens antes da agregação por linha.")
+    parser.add_argument("--loc_deleted_weight", type=float, default=0.75,
+                        help="Fator multiplicativo para scores de linhas deletadas quando only_adds=False.")
+    
+    #Localization enhancements
+    parser.add_argument('--max_codeline_length', type=int, default=256,
+                        help="max_codeline_length")
+    parser.add_argument('--max_codeline_token_length', type=int, default=64,
+                        help="max_codeline_token_length")
+    parser.add_argument("--buggy_lines_file", nargs=3, type=str, required=False,
+                        help="The input xxx_buggy_commit_lines_df.pkl (a .pkl file).")
+    parser.add_argument('--dp_loss_weight', type=float, default=0.3,
+                        help="The loss weight of the defect prediction task")
+    parser.add_argument('--dl_loss_weight', type=float, default=0.7,
+                        help="The loss weight of the defect localization task")
+    parser.add_argument("--do_locate_defects", action='store_true', default=False,
+                        help="Whether to perform defect localization in addition to defect prediction.")
 
     args = parser.parse_args()
     return args

@@ -2,6 +2,7 @@ import pandas as pd
 from torch.utils.data import Sampler
 import random
 import logging
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +17,6 @@ def calc_obf1(ma, target_th, l1, m):
     return (l1*((m**(target_th - ma) - 1)/(m**target_th - 1))) + 1
   else:
     return 1
-
-def update_orb(preds, target_th, l0, l1, m):
-  ma = sum(preds)/len(preds)
-  obf0 = calc_obf0(ma, target_th, l0, m)
-  obf1 = calc_obf1(ma, target_th, l1, m)
-  return obf0, obf1
 
 def calculate_target_th(training_pool):
   df = pd.DataFrame(training_pool)
@@ -53,12 +48,51 @@ class SkewedRandomSampler(Sampler):
     def __len__(self):
         return self.num_samples
 
+    """
     def pick_random(self, label):
         result = None
+        count = 0
 
+        for i in range(len(self.data_source)):
+           count += self.data_source[i][3]
+
+        #In case of severe imbalance, the next loop may fail to find a positive example in reaasonable time
+        positive_indices = []
+        if label == 1:
+          for i in range(len(self.data_source)):
+            if self.data_source[i][3] == 1:
+               positive_indices.append(i)
+          r = random.randint(0, len(positive_indices) - 1)
+          assert self.data_source[positive_indices[r]][3] == 1
+          return positive_indices[r]
+        
         while result is None:
             r = random.randint(0, len(self.data_source) - 1)
-            if self.data_source[r][3] == label:
+            if self.data_source[r][3] == 0:
+                result = r
+
+        return result
+    """
+    def pick_random(self, label):
+        result = None
+        count = 0
+
+        for i in range(len(self.data_source)):
+           count += self.data_source[i][4]
+
+        #In case of severe imbalance, the next loop may fail to find a positive example in reaasonable time
+        positive_indices = []
+        if label == 1:
+          for i in range(len(self.data_source)):
+            if self.data_source[i][4] == 1:
+               positive_indices.append(i)
+          r = random.randint(0, len(positive_indices) - 1)
+          assert self.data_source[positive_indices[r]][4] == 1
+          return positive_indices[r]
+        
+        while result is None:
+            r = random.randint(0, len(self.data_source) - 1)
+            if self.data_source[r][4] == 0:
                 result = r
 
         return result
@@ -67,13 +101,20 @@ class SkewedRandomSampler(Sampler):
         s = []
         logger.info(f'obf0 = {self.obf0}')
         logger.info(f'obf1 = {self.obf1}')
-
-        for _ in range(self.num_samples):
+      
+        for _ in tqdm(range(self.num_samples)):
             r = random.randint(0, int(self.obf0 + self.obf1))
+          
             if r < self.obf0:
                 s.append(self.pick_random(0))
             else:
                 s.append(self.pick_random(1))
 
-        #logger.info(f"Skewed sample: {s}")
+        logger.info(f"Skewed sample: {s}")
         return iter(s)
+    
+    def update_orb(self, preds, target_th, l0, l1, m):
+      ma = sum(preds)/len(preds)
+      self.obf0 = calc_obf0(ma, target_th, l0, m)
+      self.obf1 = calc_obf1(ma, target_th, l1, m)
+      
