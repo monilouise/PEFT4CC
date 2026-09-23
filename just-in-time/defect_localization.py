@@ -51,13 +51,11 @@ def get_line_level_metrics(line_score, label):
         else:
             top_5_acc = np.sum(label_list[:5]) / len(label_list[:5])
 
-        #################### Adjustment: considers 1 if at least one bug was found
         if top_5_acc > 0:
             top_5_acc = 1.0
         
         if top_10_acc > 0:
             top_10_acc = 1.0
-        ###########################################################################
 
         # find recall
         LOC_20_percent = line_df.head(int(0.2 * len(line_df)))
@@ -235,7 +233,7 @@ def commit_with_codes(filepath, tokenizer):
     commit2codes = []
     idx2label = []
     for _, item in data.iterrows():
-        commit_id, idx, changed_type, label, _, changed_line = item
+        commit_id, idx, changed_type, label, raw_changed_line, changed_line = item
         line_tokens = [token.replace('\u0120', '') for token in tokenizer.tokenize(changed_line)]
         for token in line_tokens:
             commit2codes.append([commit_id, idx, changed_type, token])

@@ -1,20 +1,26 @@
 import torch
 import os
+import dill
 import logging
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import recall_score, precision_score, f1_score, auc, roc_curve
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers import (
-#    AdamW, 
+    AdamW, 
     get_linear_schedule_with_warmup, 
+    TrainingArguments,
     TrainerCallback,
+    DataCollatorWithPadding,
+    Trainer
 )
 
 from util import parse_jit_args, set_seed, build_model_tokenizer_config
 from process_jitfine import JITFineDataset
 from models.ConcatModel import ConcatModel
-from torch.optim.adamw import AdamW
+from models.SingleModel import SingleModel
+from functools import partial
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

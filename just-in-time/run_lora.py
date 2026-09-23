@@ -1,3 +1,5 @@
+import time
+
 import torch
 import os
 import logging
@@ -38,7 +40,7 @@ def train(args, train_dataset, eval_dataset, mymodel, ma_dataset=None):
         train_sampler = WeightedRandomSampler(weights=sample_weights, num_samples=int(class_counts[0] + class_counts[1]), replacement=True)
     elif args.skewed_oversample: 
         train_sampler = SkewedRandomSampler(train_dataset, len(train_dataset))
-    elif args.undersample:
+    elif args.undersample: 
         targets = train_dataset.get_targets()
         class_counts = np.bincount(targets)
         assert len(class_counts) == 2
@@ -61,6 +63,7 @@ def train(args, train_dataset, eval_dataset, mymodel, ma_dataset=None):
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=4)
 
     args.max_steps = args.epochs * len(train_dataloader)
+    #args.save_steps = len(train_dataloader) // 5
     args.save_steps = max(len(train_dataloader), len(train_dataloader) // 5)
     args.warmup_steps = 0
 
@@ -190,7 +193,7 @@ def train(args, train_dataset, eval_dataset, mymodel, ma_dataset=None):
         #skewed oversampler 
         if args.skewed_oversample:
             update_sampler(args, ma_dataset, mymodel, train_sampler)
-             
+         
     if model_changed:
         update_training_status(args, "changed")
     else:
@@ -241,8 +244,10 @@ def evaluate(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        _, input_ids, input_mask, manual_features, label = [x for x in batch]
+        #input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
+            #prob, _, _ = mymodel(input_ids, input_mask, manual_features, label)
             prob, _, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
                                  label.to(args.device), output_attentions=True)
             pred_prob.append(prob.cpu().numpy())
@@ -344,6 +349,50 @@ def find_best_threshold(fpr, tpr, thresholds):
         'tpr_all': tpr
     }
     
+def predict(args, test_dataset, mymodel, tokenizer):
+    test_sampler = SequentialSampler(test_dataset)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=4)
+
+    # multi-gpu evaluate
+    if args.n_gpu > 1:
+        mymodel = torch.nn.DataParallel(mymodel, device_ids=args.available_gpu)
+
+    pred_prob = []
+    commits = []
+    mymodel.eval()
+    
+    attns = []
+    before = time.time()
+    for batch in test_dataloader:
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
+        with torch.no_grad():
+            prob, _, attn_weights = mymodel(input_ids.to(args.device), input_mask.to(args.device), 
+                                            manual_features.to(args.device), label.to(args.device), 
+                                            output_attentions=True, attn_implementation="eager") 
+            pred_prob.append(prob.cpu().numpy())
+            commits.append(commit_ids)
+            last_layer_attn_weights = attn_weights
+            
+            if not last_layer_attn_weights is None:
+                attns.append(last_layer_attn_weights.cpu().numpy())
+
+    pred_prob = np.concatenate(pred_prob, 0)
+    commits = np.concatenate(commits, 0)
+
+    if len(attns) > 0:
+        attns = np.concatenate(attns, 0)
+    
+    best_threshold = args.threshold
+
+    logger.info("best_threshold = " + str(best_threshold))
+    pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
+        
+    if args.do_locate_defects:
+        locate_defects(tokenizer, test_dataset, pred_label, pred_prob, attns, args)
+        
+    print(pred_label)
+    after = time.time()
+    logger.info("Prediction time: %.2f seconds", after - before)
     
 def test(args, test_dataset, mymodel, tokenizer):
     test_sampler = SequentialSampler(test_dataset)
@@ -360,21 +409,27 @@ def test(args, test_dataset, mymodel, tokenizer):
     
     attns = []
     for batch in test_dataloader:
+        #input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
         commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
+            #prob, loss = mymodel(input_ids, input_mask, manual_features, label)
             prob, _, attn_weights = mymodel(input_ids.to(args.device), input_mask.to(args.device), 
                                             manual_features.to(args.device), label.to(args.device), 
-                                            output_attentions=True)
+                                            output_attentions=True, attn_implementation="eager") 
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
             commits.append(commit_ids)
             last_layer_attn_weights = attn_weights
-            attns.append(last_layer_attn_weights.cpu().numpy())
+            
+            if not last_layer_attn_weights is None:
+                attns.append(last_layer_attn_weights.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
     true_label = np.concatenate(true_label, 0)
     commits = np.concatenate(commits, 0)
-    attns = np.concatenate(attns, 0)
+
+    if len(attns) > 0:
+        attns = np.concatenate(attns, 0)
     
     best_threshold = args.threshold
 
@@ -384,7 +439,7 @@ def test(args, test_dataset, mymodel, tokenizer):
     logger.info("best_threshold = " + str(best_threshold))
     pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
 
-    if args.calculate_metrics:
+    if args.calculate_metrics: 
         # Save results to excel
         results_df = pd.DataFrame({'commit_id': commits, 'pred_prob': pred_prob.squeeze(), 
                                    'true_label': true_label, 'pred_label': pred_label})
@@ -398,7 +453,7 @@ def test(args, test_dataset, mymodel, tokenizer):
         auc_score = auc(fpr, tpr)
 
         # Calculate G-Mean
-        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel()
+        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel() #labels=[0,1] 
         g_mean = 0
         r1 = 0
         r0 = 0
@@ -436,73 +491,16 @@ def test(args, test_dataset, mymodel, tokenizer):
     with open('predictions.pkl', 'wb') as f:
         pickle.dump(predictions, f)
         
-    #Defect localization
     if args.do_locate_defects:
         locate_defects(tokenizer, test_dataset, pred_label, pred_prob, attns, args)
-
-"""
-def main_test(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #args.n_gpu = len(args.available_gpu)
-    #args.device = device
-    #torch.cuda.set_device(args.available_gpu[0])
-    args.n_gpu = 1
-    args.device = device
-    torch.cuda.set_device(0)
-
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO)
-
-    set_seed(args)
-
-    model, tokenizer, config = build_model_tokenizer_config(args)
-    if args.pretrained_model in ["codet5", "codet5p-770m", "codet5p", "codet5p-2b", "codet5p-16b"]:
-        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
-                                 lora_dropout=0.1, target_modules=["q", "v"])
-    elif args.pretrained_model in ["plbart"]:
-        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
-                                 lora_dropout=0.1, target_modules=["q_proj", "v_proj"])
-    elif args.pretrained_model in ["codebert", "graphcodebert", "unixcoder"]:
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=32,
-                                 lora_dropout=0.1, target_modules=["query", "value"])
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
-
-    #mymodel = SingleModel(model, config, tokenizer, args).to(device)
-    mymodel = ConcatModel(model, config, tokenizer, args).to(device)
-    # print(mymodel)
-
-    # store_path = "../datasets/jitfine"
-    # with open(os.path.join(store_path, "train.pkl"), 'rb') as frb1:
-    #     train_dataset = dill.load(frb1)
-    # with open(os.path.join(store_path, "eval.pkl"), 'rb') as frb2:
-    #     eval_dataset = dill.load(frb2)
-    # with open(os.path.join(store_path, "test.pkl"), 'rb') as frb3:
-    #     test_dataset = dill.load(frb3)
-
-    if args.do_train:
-        #
-        #train_dataset = JITFineDataset(tokenizer, args, "train")
-        #eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train_dataset = JITFineMessageManualDataset(tokenizer, args, "train")
-        eval_dataset = JITFineMessageManualDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
-
-    if args.do_test:
-        #test_dataset = JITFineDataset(tokenizer, args, "test")
-        test_dataset = JITFineMessageManualDataset(tokenizer, args, "test")
-        checkpoint_prefix = 'checkpoint-best-f1/model.bin'
-        output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
-        checkpoint = torch.load(output_dir)
-        mymodel.load_state_dict(checkpoint['model_state_dict'])
-        test(args, test_dataset, mymodel)
-"""
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = 1
     args.device = device
-    torch.cuda.set_device(0)
+    
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
 
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO)
@@ -517,7 +515,9 @@ def main(args):
         peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
                                  lora_dropout=0.1, target_modules=["q_proj", "v_proj"])
     elif args.pretrained_model in ["codebert", "graphcodebert", "unixcoder"]:
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=32,
+        #peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=32,
+        #                         lora_dropout=0.1, target_modules=["query", "value"])
+        peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, r=64, lora_alpha=32,
                                  lora_dropout=0.1, target_modules=["query", "value"])
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
@@ -526,6 +526,7 @@ def main(args):
         mymodel = ManualModel(args).to(device)
     else:
         mymodel = ConcatModel(model, config, tokenizer, args).to(device)
+        #mymodel = SingleModel(model, config, tokenizer, args).to(device)
 
     if args.do_train:
         logger.info("Training for the first time...")
@@ -543,6 +544,7 @@ def main(args):
         
     if args.do_resume_training:
         logger.info("Resuming training...")
+        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
@@ -564,12 +566,27 @@ def main(args):
             test_dataset = JITFineManualDataset(args, "test")
         else:
             test_dataset = JITFineDataset(tokenizer, args, "test")
-
+        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
         mymodel.load_state_dict(checkpoint['model_state_dict'])
         test(args, test_dataset, mymodel, tokenizer)
+        
+    if args.do_predict:
+        if args.only_manual:
+            test_dataset = JITFineManualDataset(args, "test")
+        else:
+            test_dataset = JITFineDataset(tokenizer, args, "test")
+        checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
+        output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
+        checkpoint = torch.load(output_dir, map_location=args.device)
+        
+        mymodel.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if hasattr(mymodel.encoder, "merge_and_unload"):
+            mymodel.encoder = mymodel.encoder.merge_and_unload()
+    
+        predict(args, test_dataset, mymodel, tokenizer)
 
 if __name__ == "__main__":
     args = parse_jit_args()

@@ -1,30 +1,33 @@
 import torch
 import os
 import logging
-import multiprocessing
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import recall_score, precision_score, f1_score, auc, roc_curve, confusion_matrix
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler, SubsetRandomSampler
-#from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import get_linear_schedule_with_warmup
+from peft import TaskType, get_peft_model, PrefixTuningConfig
+
 from torch.optim.adamw import AdamW
-from peft import LoraConfig, TaskType, get_peft_model
 
 from util import parse_jit_args, set_seed, build_model_tokenizer_config
-from process_jitfine import JITFineDataset, JITFineMessageManualDataset, JITFineDatasetWithTextManualFeatures
-from models.SingleModel import SingleModel
+from process_jitfine import JITFineDataset
 from models.ConcatModel import ConcatModel
+from models.ManualModel import ManualModel
+from process_jitfine import JITFineManualDataset
+
 import pandas as pd
 
-from skewed_oversample import SkewedRandomSampler, update_orb
+from skewed_oversample import SkewedRandomSampler
 import pickle
-from peft import IA3Config
+from defect_localization import locate_defects
+from online_training import calculate_rolling_roc_auc
+import time
 
 logger = logging.getLogger(__name__)
 
 
-def train(args, train_dataset, eval_dataset, mymodel):
+def train(args, train_dataset, eval_dataset, mymodel, ma_dataset=None):
     if args.oversample: 
         targets = train_dataset.get_targets()
         class_counts = np.bincount(targets)
@@ -59,9 +62,11 @@ def train(args, train_dataset, eval_dataset, mymodel):
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size, num_workers=4)
 
     args.max_steps = args.epochs * len(train_dataloader)
-    #args.save_steps = len(train_dataloader) // 5
+    #args.save_steps = max(len(train_dataloader), len(train_dataloader) // 5)
+    
+    args.save_steps = len(train_dataloader)
 
-    args.save_steps = max(len(train_dataloader), len(train_dataloader) // 5)
+
     args.warmup_steps = 0
 
     optimizer = AdamW(mymodel.parameters(), lr=args.learning_rate)
@@ -72,7 +77,6 @@ def train(args, train_dataset, eval_dataset, mymodel):
     if args.n_gpu > 1:
         mymodel = torch.nn.DataParallel(mymodel, device_ids=args.available_gpu)
 
-    #best_f1 = 0
     best = 0
 
     # Evaluate before training
@@ -95,9 +99,10 @@ def train(args, train_dataset, eval_dataset, mymodel):
         tr_loss = 0
         tr_num = 0
         for step, batch in enumerate(bar):
-            input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+            commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
             mymodel.train()
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            _, loss, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device), output_attentions=True)
             if args.n_gpu > 1:
                 loss = loss.mean()
 
@@ -145,9 +150,26 @@ def train(args, train_dataset, eval_dataset, mymodel):
                     }
                     torch.save(save_content, output_file)
                     model_changed = True
-                elif args.eval_metric == "gmean" and results["g_mean"] > best:
+                elif args.eval_metric == "gmean" and "g_mean" in results and results["g_mean"] > best:
                     patience = 0
                     best = results["g_mean"]
+                    checkpoint_prefix = "checkpoint-best-gmean"
+                    output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    model_to_save = mymodel.module if hasattr(mymodel, 'module') else mymodel
+                    output_file = os.path.join(output_dir, "model.bin")
+                    save_content = {
+                        "model_state_dict": model_to_save.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict()
+                    }
+                    logger.info("Saving model to {}".format(output_file))
+                    torch.save(save_content, output_file)
+                    model_changed = True
+                elif args.eval_metric == "gmean" and "eval_loss" in results and (results["eval_loss"] < best or best == 0):
+                    patience = 0
+                    best = results["eval_loss"]
                     checkpoint_prefix = "checkpoint-best-gmean"
                     output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
                     if not os.path.exists(output_dir):
@@ -167,21 +189,19 @@ def train(args, train_dataset, eval_dataset, mymodel):
                         logger.info('patience greater than {}, early stop!'.format(args.patience))
                         return
                     
-        #skewed oversampler 
         if args.skewed_oversample:
-            update_sampler(args, train_dataset, mymodel, train_sampler)
-    
+            update_sampler(args, ma_dataset, mymodel, train_sampler)
+            
     if model_changed:
         update_training_status(args, "changed")
     else:
         update_training_status(args, "unchanged")
 
-def update_sampler(args, train_dataset, mymodel, train_sampler):
-    logger.info("Updating sampler...")
-    results_ma = predict_ma(args, train_dataset[-args.window_size:], mymodel)
-    orb0, orb1 = update_orb(results_ma, args.target_th, args.l0, args.l1, args.m)
-    train_sampler.obf0 = orb0
-    train_sampler.obf1 = orb1
+def update_sampler(args, ma_dataset, mymodel, train_sampler):
+    logger.info(f"Updating sampler. Window size = {args.window_size}, target_th = {args.target_th}, l0 = {args.l0}, l1 = {args.l1}, m = {args.m}")
+    assert len(ma_dataset) <= args.window_size, "Dataset must have at most window_size elements for skewed oversampling."
+    results_ma = predict_ma(args, ma_dataset, mymodel)
+    train_sampler.update_orb(results_ma, args.target_th, args.l0, args.l1, args.m)
 
 def update_training_status(args, status):
     with open(os.path.join(args.output_dir, "training_status.txt"), "w") as log_file:
@@ -195,9 +215,11 @@ def predict_ma(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        _, input_ids, input_mask, manual_features, label = [x for x in batch]
+        
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device))
             pred_prob.append(prob.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
@@ -215,9 +237,10 @@ def evaluate(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                 label.to(args.device), output_attentions=True) 
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
 
@@ -257,16 +280,17 @@ def evaluate_gmean(args, eval_dataset, mymodel):
     mymodel.eval()
 
     for batch in eval_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        _, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, loss, _ = mymodel(input_ids.to(args.device), input_mask.to(args.device), manual_features.to(args.device), 
+                                    label.to(args.device))
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
     true_label = np.concatenate(true_label, 0)
 
-    if true_label.sum() > 0:
+    if true_label.sum() > 0 and true_label.sum() < len(true_label):
         best_threshold = args.threshold
 
         pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
@@ -278,7 +302,6 @@ def evaluate_gmean(args, eval_dataset, mymodel):
         fpr, tpr, thres = roc_curve(true_label, pred_prob)
         auc_score = auc(fpr, tpr)
 
-        # Calculate G-Mean
         tn, fp, fn, tp = confusion_matrix(true_label, pred_label).ravel()
         g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
         r1 = tp / (tp + fn)
@@ -292,19 +315,74 @@ def evaluate_gmean(args, eval_dataset, mymodel):
             "g_mean": g_mean,
         }
 
-        logger.info("***** Eval results *****")
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(round(result[key], 4)))
-
-        return result
     else:
         logger.info("No positive examples -> using validation loss...")
         result = {"eval_loss": loss}
-        return result
+    
+    logger.info("***** Eval results *****")
+    for key in sorted(result.keys()):
+        logger.info("  %s = %s", key, str(round(float(result[key]), 4)))
 
+    return result
 
+def find_best_threshold(fpr, tpr, thresholds):
+    distances = np.sqrt((fpr - 0)**2 + (tpr - 1)**2)
+    best_index = np.argmin(distances)
+    return {
+        'best_threshold': thresholds[best_index],
+        'fpr': fpr[best_index],
+        'tpr': tpr[best_index],
+        'distance': distances[best_index],
+        'fpr_all': fpr,
+        'tpr_all': tpr
+    }
+    
+def predict(args, test_dataset, mymodel, tokenizer):
+    test_sampler = SequentialSampler(test_dataset)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=4)
 
-def test(args, test_dataset, mymodel):
+    # multi-gpu evaluate
+    if args.n_gpu > 1:
+        mymodel = torch.nn.DataParallel(mymodel, device_ids=args.available_gpu)
+
+    pred_prob = []
+    commits = []
+    mymodel.eval()
+    
+    attns = []
+    before = time.time()
+    for batch in test_dataloader:
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
+        with torch.no_grad():
+            prob, _, attn_weights = mymodel(input_ids.to(args.device), input_mask.to(args.device), 
+                                            manual_features.to(args.device), label.to(args.device), 
+                                            output_attentions=True, attn_implementation="eager") 
+            pred_prob.append(prob.cpu().numpy())
+            commits.append(commit_ids)
+            last_layer_attn_weights = attn_weights
+            
+            if not last_layer_attn_weights is None:
+                attns.append(last_layer_attn_weights.cpu().numpy())
+
+    pred_prob = np.concatenate(pred_prob, 0)
+    commits = np.concatenate(commits, 0)
+
+    if len(attns) > 0:
+        attns = np.concatenate(attns, 0)
+    
+    best_threshold = args.threshold
+
+    logger.info("best_threshold = " + str(best_threshold))
+    pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
+        
+    if args.do_locate_defects:
+        locate_defects(tokenizer, test_dataset, pred_label, pred_prob, attns, args)
+        
+    print(pred_label)
+    after = time.time()
+    logger.info("Prediction time: %.2f seconds", after - before)
+    
+def test(args, test_dataset, mymodel, tokenizer):
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=4)
 
@@ -314,40 +392,43 @@ def test(args, test_dataset, mymodel):
 
     pred_prob = []
     true_label = []
+    commits = []
     mymodel.eval()
-
+    
+    attns = []
     for batch in test_dataloader:
-        input_ids, input_mask, manual_features, label = [x.to(args.device) for x in batch]
+        commit_ids, input_ids, input_mask, manual_features, label = [x for x in batch]
         with torch.no_grad():
-            prob, loss = mymodel(input_ids, input_mask, manual_features, label)
+            prob, _, attn_weights = mymodel(input_ids.to(args.device), input_mask.to(args.device), 
+                                            manual_features.to(args.device), label.to(args.device), 
+                                            output_attentions=True) 
             pred_prob.append(prob.cpu().numpy())
             true_label.append(label.cpu().numpy())
+            commits.append(commit_ids)
+            last_layer_attn_weights = attn_weights
+
+            if last_layer_attn_weights is not None:
+                attns.append(last_layer_attn_weights.cpu().numpy())
 
     pred_prob = np.concatenate(pred_prob, 0)
     true_label = np.concatenate(true_label, 0)
+    commits = np.concatenate(commits, 0)
+
+    if len(attns) > 0:
+        attns = np.concatenate(attns, 0)
+    
     best_threshold = args.threshold
 
     if args.calculate_metrics:
         assert true_label.sum() > 0
 
+    logger.info("best_threshold = " + str(best_threshold))
     pred_label = [0 if x < best_threshold else 1 for x in pred_prob]
 
-    #Saves 2 correct classification for further analysis
-    examples = []
-    for i in range(len(true_label)):
-        if true_label[i] == 1 and pred_label[i] == 1:
-            examples.append(i)
-
-        if len(examples) == 2:
-            break
-
-    with open('examples.pkl', 'wb') as f:
-        pickle.dump(examples, f)
-
     if args.calculate_metrics: 
-        # Save results to excel
-        results_df = pd.DataFrame({'pred_prob': pred_prob.squeeze(), 'true_label': true_label, 'pred_label': pred_label})
-        results_df.to_excel('results.xlsx', index=False)
+        results_df = pd.DataFrame({'commit_id': commits, 'pred_prob': pred_prob.squeeze(), 
+                                   'true_label': true_label, 'pred_label': pred_label})
+        results_df.to_csv('results.csv', index=False)
 
         precision = precision_score(true_label, pred_label, average="binary")
         recall = recall_score(true_label, pred_label, average="binary")
@@ -356,15 +437,17 @@ def test(args, test_dataset, mymodel):
         fpr, tpr, thres = roc_curve(true_label, pred_prob)
         auc_score = auc(fpr, tpr)
 
-        # Calculate G-Mean
-        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel() #labels=[0,1] 
-        g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
-        r1 = tp / (tp + fn)
-            
-        print('r1 = ', r1)
-        print('recall = ', recall)
-        assert r1 == recall
-        r0 = tn / (tn + fp)
+        tn, fp, fn, tp = confusion_matrix(true_label, pred_label, labels=[0,1]).ravel() 
+        g_mean = 0
+        r1 = 0
+        r0 = 0
+
+        if tp + fn > 0 and tn + fp > 0:    
+            g_mean = np.sqrt((tp / (tp + fn)) * (tn / (tn + fp)))
+            r1 = tp / (tp + fn)
+                
+            assert r1 == recall
+            r0 = tn / (tn + fp)
 
         result = {
             "test_recall": recall,
@@ -376,78 +459,32 @@ def test(args, test_dataset, mymodel):
             "R1": r1
         }
 
+        if args.online_mode:
+            metric = calculate_rolling_roc_auc(pred_prob, true_label)
+            result["rolling_auc"] = metric.get()
+
         with open('results.pkl', 'wb') as f:
             pickle.dump(result, f)
 
         logger.info("***** Test results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
-
+        
     predictions = {'pred_label': pred_label, 'true_label': true_label, 'pred_prob': pred_prob.tolist()}
 
     with open('predictions.pkl', 'wb') as f:
         pickle.dump(predictions, f)
-
-def main_test(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #args.n_gpu = len(args.available_gpu)
-    #args.device = device
-    #torch.cuda.set_device(args.available_gpu[0])
-    args.n_gpu = 1
-    args.device = device
-    torch.cuda.set_device(0)
-
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO)
-
-    set_seed(args)
-
-    model, tokenizer, config = build_model_tokenizer_config(args)
-    if args.pretrained_model in ["codet5", "codet5p-770m", "codet5p", "codet5p-2b", "codet5p-16b"]:
-        peft_config = IA3Config(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False)
-    elif args.pretrained_model in ["plbart"]:
-        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
-                                 lora_dropout=0.1, target_modules=["q_proj", "v_proj"])
-    elif args.pretrained_model in ["codebert", "graphcodebert", "unixcoder"]:
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=32,
-                                 lora_dropout=0.1, target_modules=["query", "value"])
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
-
-    #mymodel = SingleModel(model, config, tokenizer, args).to(device)
-    mymodel = ConcatModel(model, config, tokenizer, args).to(device)
-    # print(mymodel)
-
-    # store_path = "../datasets/jitfine"
-    # with open(os.path.join(store_path, "train.pkl"), 'rb') as frb1:
-    #     train_dataset = dill.load(frb1)
-    # with open(os.path.join(store_path, "eval.pkl"), 'rb') as frb2:
-    #     eval_dataset = dill.load(frb2)
-    # with open(os.path.join(store_path, "test.pkl"), 'rb') as frb3:
-    #     test_dataset = dill.load(frb3)
-
-    if args.do_train:
-        #
-        #train_dataset = JITFineDataset(tokenizer, args, "train")
-        #eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train_dataset = JITFineMessageManualDataset(tokenizer, args, "train")
-        eval_dataset = JITFineMessageManualDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
-
-    if args.do_test:
-        #test_dataset = JITFineDataset(tokenizer, args, "test")
-        test_dataset = JITFineMessageManualDataset(tokenizer, args, "test")
-        checkpoint_prefix = 'checkpoint-best-f1/model.bin'
-        output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
-        checkpoint = torch.load(output_dir)
-        mymodel.load_state_dict(checkpoint['model_state_dict'])
-        test(args, test_dataset, mymodel)
+        
+    if args.do_locate_defects:
+        locate_defects(tokenizer, test_dataset, pred_label, pred_prob, attns, args)
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = 1
     args.device = device
-    torch.cuda.set_device(0)
+    
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
 
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO)
@@ -455,49 +492,91 @@ def main(args):
     set_seed(args)
 
     model, tokenizer, config = build_model_tokenizer_config(args)
+    """
     if args.pretrained_model in ["codet5", "codet5p-770m", "codet5p", "codet5p-2b", "codet5p-16b", "codereviewer"]:
-        #peft_config = IA3Config(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False)
-        peft_config = IA3Config(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, target_modules=["q", "v"])
+        peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
+                                 lora_dropout=0.1, target_modules=["q", "v"])
     elif args.pretrained_model in ["plbart"]:
         peft_config = LoraConfig(task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=64, lora_alpha=32,
                                  lora_dropout=0.1, target_modules=["q_proj", "v_proj"])
     elif args.pretrained_model in ["codebert", "graphcodebert", "unixcoder"]:
         peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=64, lora_alpha=32,
                                  lora_dropout=0.1, target_modules=["query", "value"])
+    """
+    if args.method in ["prefix"]:
+        peft_config = PrefixTuningConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            inference_mode=False,
+            num_virtual_tokens=args.prompt_token_num)
+        
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
-    mymodel = ConcatModel(model, config, tokenizer, args).to(device)
-    #mymodel = SingleModel(model, config, tokenizer, args).to(device)
+    if args.only_manual:
+        mymodel = ManualModel(args).to(device)
+    else:
+        mymodel = ConcatModel(model, config, tokenizer, args).to(device)
+
+    args.max_input_tokens = args.max_input_tokens - args.prompt_token_num
 
     if args.do_train:
         logger.info("Training for the first time...")
-        train_dataset = JITFineDataset(tokenizer, args, "train")
-        eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
+        if args.only_manual:
+            train_dataset = JITFineManualDataset(args, "train")
+            eval_dataset = JITFineManualDataset(args, "eval")
+        else:
+            train_dataset = JITFineDataset(tokenizer, args, "train")
+            eval_dataset = JITFineDataset(tokenizer, args, "eval")
+            
+        if args.skewed_oversample:
+            ma_dataset = JITFineDataset(tokenizer, args, "train", is_ma_dataset=True)
+            
+        train(args, train_dataset, eval_dataset, mymodel, ma_dataset if args.skewed_oversample else None)
         
     if args.do_resume_training:
         logger.info("Resuming training...")
-        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
         mymodel.load_state_dict(checkpoint['model_state_dict'])
-        train_dataset = JITFineDataset(tokenizer, args, "train")
-        eval_dataset = JITFineDataset(tokenizer, args, "eval")
-        train(args, train_dataset, eval_dataset, mymodel)
+        if args.only_manual:
+            train_dataset = JITFineManualDataset(args, "train")
+            eval_dataset = JITFineManualDataset(args, "eval")
+        else:
+            train_dataset = JITFineDataset(tokenizer, args, "train")
+            eval_dataset = JITFineDataset(tokenizer, args, "eval")
+            
+        if args.skewed_oversample:
+            ma_dataset = JITFineDataset(tokenizer, args, "train", is_ma_dataset=True)
+                
+        train(args, train_dataset, eval_dataset, mymodel, ma_dataset if args.skewed_oversample else None)
     
     if args.do_test:
-        test_dataset = JITFineDataset(tokenizer, args, "test")
-        #checkpoint_prefix = 'checkpoint-best-f1/model.bin'
+        if args.only_manual:
+            test_dataset = JITFineManualDataset(args, "test")
+        else:
+            test_dataset = JITFineDataset(tokenizer, args, "test")
+
         checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
         checkpoint = torch.load(output_dir)
         mymodel.load_state_dict(checkpoint['model_state_dict'])
-        test(args, test_dataset, mymodel)
+        test(args, test_dataset, mymodel, tokenizer)
+        
+    if args.do_predict:
+        if args.only_manual:
+            test_dataset = JITFineManualDataset(args, "test")
+        else:
+            test_dataset = JITFineDataset(tokenizer, args, "test")
+        checkpoint_prefix = f'checkpoint-best-{args.eval_metric}/model.bin'
+        output_dir = os.path.join(args.output_dir, f"{checkpoint_prefix}")
+        checkpoint = torch.load(output_dir, map_location=args.device)
+        mymodel.load_state_dict(checkpoint['model_state_dict'])
+        predict(args, test_dataset, mymodel, tokenizer)
 
 if __name__ == "__main__":
     args = parse_jit_args()
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+    logger.setLevel(logging.INFO)
     main(args)

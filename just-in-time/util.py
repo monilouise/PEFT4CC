@@ -8,17 +8,6 @@ from transformers import (RobertaModel, RobertaTokenizer, RobertaConfig, T5ForCo
 import logging
 
 
-def str2bool(value):
-    if isinstance(value, bool):
-        return value
-    value = value.lower()
-    if value in {"yes", "true", "t", "1", "y"}:
-        return True
-    if value in {"no", "false", "f", "0", "n"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
 def parse_jit_args():
     parser = argparse.ArgumentParser()
 
@@ -50,13 +39,13 @@ def parse_jit_args():
     parser.add_argument("--available_gpu", type=list, default=[1, 2, 3, 0])
     parser.add_argument("--do_train", action='store_true')
     parser.add_argument("--do_test", action='store_true')
+    parser.add_argument("--do_predict", action='store_true')
     parser.add_argument("--use_lora", action='store_true')
 
     parser.add_argument("--eval_metric", type=str, default="f1")
     parser.add_argument("--do_resume_training", action='store_true', default=False)
     parser.add_argument("--oversample", action='store_true', default=False)
     parser.add_argument("--undersample", action='store_true', default=False)
-    parser.add_argument("--online_mode", action='store_true', default=False)
     parser.add_argument("--calculate_metrics", action='store_true', default=False)
     
     parser.add_argument("--skewed_oversample", action='store_true', default=False)
@@ -69,30 +58,16 @@ def parse_jit_args():
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--cross_project", action='store_true', default=False)
     parser.add_argument("--buggy_line_filepath", type=str, default=None)
-    parser.add_argument("--only_adds", type=str2bool, nargs='?', const=True, default=True,
-                        help="Whether to consider only added lines for localization (pass False to include deletions)")
+    parser.add_argument("--only_adds", action='store_true', default=True)
+    parser.add_argument("--do_locate_defects", action='store_true', default=False)
+    parser.add_argument("--online_mode", action='store_true', default=False)
+    parser.add_argument("--stream_data_file", nargs=2, type=str)
+    parser.add_argument("--update_threshold", action='store_true', default=False)
 
-    # Localization inference-only enhancements
-    parser.add_argument("--loc_last_k_layers", type=int, default=1, help="Number of last encoder layers to average attentions over for defect localization (1 = last layer only).")
-    parser.add_argument("--loc_layer_weighting", type=str, default="none", choices=["none", "exp"], help="Strategy to combine last k layers: uniform average or exponential weights (exp higher weight to last).")
-    parser.add_argument("--loc_layer_exp_alpha", type=float, default=0.7, help="Alpha for exponential layer weighting: w_i = exp(-alpha*(k-1-i)). Higher alpha decays older layers faster.")
-    parser.add_argument("--loc_attn_temp", type=float, default=1.0, help="Temperature (<1 sharpens, >1 suaviza) aplicada à distribuição de atenção CLS->tokens antes da agregação por linha.")
-    parser.add_argument("--loc_deleted_weight", type=float, default=0.75,
-                        help="Fator multiplicativo para scores de linhas deletadas quando only_adds=False.")
-    
-    #Localization enhancements
-    parser.add_argument('--max_codeline_length', type=int, default=256,
-                        help="max_codeline_length")
-    parser.add_argument('--max_codeline_token_length', type=int, default=64,
-                        help="max_codeline_token_length")
-    parser.add_argument("--buggy_lines_file", nargs=3, type=str, required=False,
-                        help="The input xxx_buggy_commit_lines_df.pkl (a .pkl file).")
-    parser.add_argument('--dp_loss_weight', type=float, default=0.3,
-                        help="The loss weight of the defect prediction task")
-    parser.add_argument('--dl_loss_weight', type=float, default=0.7,
-                        help="The loss weight of the defect localization task")
-    parser.add_argument("--do_locate_defects", action='store_true', default=False,
-                        help="Whether to perform defect localization in addition to defect prediction.")
+    #From the new repo
+    parser.add_argument("--method", type=str, default="")
+    parser.add_argument("--structure", type=str, default=None)
+    parser.add_argument("--prompt_token_num", type=int, default=50)
 
     args = parser.parse_args()
     return args
@@ -139,23 +114,24 @@ def build_model_tokenizer_config(args):
         config.hidden_dropout_prob = args.dropout
         config.attention_probs_dropout_prob = args.dropout
     
-    # load tokenizer.
-    tokenizer = tokenizer_class.from_pretrained(actual_name)
     special_tokens_dict = {"additional_special_tokens": ["[ADD]", "[DEL]"]}
 
     if args.pretrained_model in ["codet5p-2b", "codet5p-6b", "codet5p-16b"]:
         special_tokens_dict["additional_special_tokens"].extend(["<s>", "</s>"])
-        tokenizer.cls_token = "<s>"
-        tokenizer.sep_token = "</s>"
 
-    tokenizer.add_special_tokens(special_tokens_dict)
+    tokenizer = tokenizer_class.from_pretrained(actual_name,
+                                                extra_special_tokens=special_tokens_dict["additional_special_tokens"])
+    tokenizer.cls_token = "<s>"
+    tokenizer.sep_token = "</s>"
+    ##################
+    
     # load pretrained model.
     if config:
-        model = model_class.from_pretrained(actual_name, config=config)
+        model = model_class.from_pretrained(actual_name, config=config, use_safetensors=False)
     else:
         logger = logging.getLogger(__name__)
         logger.info(f"Loading model {actual_name}")
-        model = model_class.from_pretrained(actual_name)
+        model = model_class.from_pretrained(actual_name, use_safetensors=False)
 
     model.resize_token_embeddings(len(tokenizer))
 
